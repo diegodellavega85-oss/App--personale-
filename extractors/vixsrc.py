@@ -1,15 +1,19 @@
 import asyncio
 import json
 import logging
+import os
 import random
 import re
+import threading
 import time
 from typing import Any, Dict
 from urllib.parse import parse_qs, parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
-from aiohttp_socks import ProxyConnector
+from aiohttp_socks import ProxyError as AioProxyError
+from python_socks import ProxyError as PyProxyError
+from config import get_proxy_for_url, TRANSPORT_ROUTES, GLOBAL_PROXIES, get_connector_for_proxy, SELECTED_PROXY_CONTEXT
 
 logger = logging.getLogger(__name__)
 
@@ -20,15 +24,23 @@ class ExtractorError(Exception):
 
 class VixSrcExtractor:
     """VixSrc URL extractor per risolvere link VixSrc."""
-
     def __init__(self, request_headers: dict, proxies: list = None):
         self.request_headers = request_headers
         self.base_headers = self._default_headers()
         self.session = None
         self.mediaflow_endpoint = "hls_manifest_proxy"
         self._session_lock = asyncio.Lock()
-        self.proxies = proxies or []
+        self.proxies = proxies or GLOBAL_PROXIES
         self.is_vixsrc = True
+        self.last_used_proxy = None
+    @staticmethod
+    def _normalize_proxy_url(proxy_value: str) -> str:
+        proxy_value = proxy_value.strip()
+        if proxy_value.startswith("socks5://"):
+            return proxy_value.replace("socks5://", "socks5h://", 1)
+        if "://" not in proxy_value:
+            return f"socks5h://{proxy_value}"
+        return proxy_value
 
     @staticmethod
     def _default_headers() -> dict:
@@ -60,6 +72,27 @@ class VixSrcExtractor:
         """Restituisce un proxy casuale dalla lista."""
         return random.choice(self.proxies) if self.proxies else None
 
+    def _build_session_for_proxy(self, proxy: str | None) -> ClientSession:
+        timeout = ClientTimeout(total=60, connect=30, sock_read=30)
+        if proxy:
+            logger.debug("Using proxy %s for VixSrc session.", proxy)
+            connector = get_connector_for_proxy(proxy)
+        else:
+            connector = TCPConnector(
+                limit=0,
+                limit_per_host=0,
+                keepalive_timeout=30,
+                enable_cleanup_closed=True,
+                force_close=False,
+                use_dns_cache=True,
+            )
+        return ClientSession(
+            timeout=timeout,
+            connector=connector,
+            headers=self._default_headers(),
+            cookie_jar=aiohttp.CookieJar(),
+        )
+
     @staticmethod
     def _raise_if_embed_expired(url: str):
         parsed = urlparse(url)
@@ -79,29 +112,18 @@ class VixSrcExtractor:
                 "Use the original /movie/ or /tv/ URL to refresh tokens."
             )
 
-    async def _get_session(self):
+    async def _get_session(self, url: str = None):
         """Ottiene una sessione HTTP persistente."""
         if self.session is None or self.session.closed:
-            timeout = ClientTimeout(total=60, connect=30, sock_read=30)
-            proxy = self._get_random_proxy()
-            if proxy:
-                logger.info("Using proxy %s for VixSrc session.", proxy)
-                connector = ProxyConnector.from_url(proxy)
+            proxy = None
+            if url:
+                proxy = get_proxy_for_url(url, TRANSPORT_ROUTES, self.proxies)
             else:
-                connector = TCPConnector(
-                    limit=0,
-                    limit_per_host=0,
-                    keepalive_timeout=30,
-                    enable_cleanup_closed=True,
-                    force_close=False,
-                    use_dns_cache=True,
-                )
-            self.session = ClientSession(
-                timeout=timeout,
-                connector=connector,
-                headers=self._default_headers(),
-                cookie_jar=aiohttp.CookieJar(),
-            )
+                proxy = self._get_random_proxy()
+            if proxy:
+                proxy = self._normalize_proxy_url(proxy)
+                self.last_used_proxy = proxy
+            self.session = self._build_session_for_proxy(proxy)
         return self.session
 
     async def _make_robust_request(
@@ -112,7 +134,7 @@ class VixSrcExtractor:
 
         for attempt in range(retries):
             try:
-                session = await self._get_session()
+                session = await self._get_session(url)
                 logger.info("Attempt %s/%s for URL: %s", attempt + 1, retries, url)
 
                 async with session.get(url, headers=final_headers) as response:
@@ -149,18 +171,29 @@ class VixSrcExtractor:
                 asyncio.TimeoutError,
                 OSError,
                 ConnectionResetError,
+                AioProxyError,
+                PyProxyError,
             ) as e:
+                is_proxy_err = isinstance(e, (AioProxyError, PyProxyError))
+                is_timeout = isinstance(e, asyncio.TimeoutError)
+                err_type = "Proxy" if is_proxy_err else ("Timeout" if is_timeout else "Connection")
+                
                 logger.warning(
-                    "Connection error attempt %s for %s: %s", attempt + 1, url, str(e)
+                    "%s error attempt %s for %s: %s", err_type, attempt + 1, url, str(e)
                 )
 
-                if attempt == retries - 1:
-                    if self.session and not self.session.closed:
-                        try:
-                            await self.session.close()
-                        except Exception:
-                            pass
-                        self.session = None
+                # Reset session
+                if self.session and not self.session.closed:
+                    try:
+                        await self.session.close()
+                    except Exception:
+                        pass
+                self.session = None
+                
+                if is_proxy_err and SELECTED_PROXY_CONTEXT.get():
+                    logger.info("Clearing sticky proxy context due to ProxyError")
+                    SELECTED_PROXY_CONTEXT.set(None)
+
 
                 if attempt < retries - 1:
                     delay = initial_delay * (2**attempt)
@@ -168,6 +201,15 @@ class VixSrcExtractor:
                     await asyncio.sleep(delay)
                 else:
                     raise ExtractorError(f"All {retries} attempts failed for {url}: {str(e)}")
+
+            except aiohttp.ClientResponseError as e:
+                if e.status == 404:
+                    raise ExtractorError(f"VixSrc content not found (404): {url}")
+                
+
+                if attempt == retries - 1:
+                    raise ExtractorError(f"Final HTTP error {e.status} for {url}: {str(e)}")
+                await asyncio.sleep(initial_delay)
 
             except Exception as e:
                 logger.error("Non-network error attempt %s for %s: %s", attempt + 1, url, str(e))
@@ -352,10 +394,14 @@ class VixSrcExtractor:
 
             if "/playlist/" in parsed_url.path:
                 logger.info("URL is already a VixSrc manifest, no extraction required.")
+                # Preserve selected_proxy from query if present
+                selected_proxy = kwargs.get("proxy") or parse_qs(parsed_url.query).get("proxy", [None])[0]
+                logger.debug(f"Extractor Debug: Extractor result selected_proxy: {selected_proxy}")
                 return {
                     "destination_url": url,
                     "request_headers": self._fresh_headers(),
                     "mediaflow_endpoint": self.mediaflow_endpoint,
+                    "selected_proxy": selected_proxy or self.last_used_proxy,
                 }
 
             if "/embed/" in parsed_url.path:
@@ -415,6 +461,7 @@ class VixSrcExtractor:
                     "destination_url": final_url,
                     "request_headers": stream_headers,
                     "mediaflow_endpoint": self.mediaflow_endpoint,
+                    "selected_proxy": self.last_used_proxy,
                 }
             except Exception as e:
                 raise ExtractorError(f"JavaScript script parsing error: {e}")
