@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: diegodellavega85-oss/app--personale-
+  IMAGE_NAME: diegodellavega85-oss/app--personale
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
