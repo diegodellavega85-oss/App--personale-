@@ -8,6 +8,7 @@ from typing import Any, Optional
 
 import aiohttp
 from config import FLARESOLVERR_URL, FLARESOLVERR_TIMEOUT, get_proxy_for_url, TRANSPORT_ROUTES, GLOBAL_PROXIES
+from config import PROXY_TEST_TIMEOUT
 from curl_cffi.requests import AsyncSession
 
 logger = logging.getLogger(__name__)
@@ -88,7 +89,7 @@ class CinemaCityExtractor:
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.5",
                 "Referer": "https://cinemacity.cc/",
-            }, **request_kwargs)
+            }, timeout=PROXY_TEST_TIMEOUT, **request_kwargs)
             html = r.text
             resp_cookies = dict(r.cookies) if hasattr(r, 'cookies') else {}
             logger.info(f"CinemaCity: curl_cffi status={r.status_code} len={len(html)}")

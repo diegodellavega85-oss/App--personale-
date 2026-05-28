@@ -4,6 +4,7 @@ import random
 import socket
 import time
 import contextvars
+import urllib.request
 from dotenv import load_dotenv
 
 # ContextVar for thread-safe/async-safe warp bypass state
@@ -22,6 +23,8 @@ LOG_LEVEL_MAP = {
     "CRITICAL": logging.CRITICAL,
 }
 LOG_LEVEL = LOG_LEVEL_MAP.get(LOG_LEVEL_STR, logging.WARNING)
+PROXY_TEST_TIMEOUT = int(os.environ.get("PROXY_TEST_TIMEOUT", "5"))
+PROXY_TEST_CONCURRENCY = max(1, int(os.environ.get("PROXY_TEST_CONCURRENCY", "60")))
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -44,16 +47,54 @@ def parse_proxies(proxy_env_var: str) -> list:
     """Analizza una stringa di proxy separati da virgola da una variabile d'ambiente."""
     proxies_str = os.environ.get(proxy_env_var, "").strip()
     if proxies_str:
-        return [p.strip() for p in proxies_str.split(",") if p.strip()]
+        proxies = []
+        for proxy in proxies_str.split(","):
+            proxy = proxy.strip()
+            if proxy.startswith("="):
+                proxy = proxy[1:].strip()
+            if proxy:
+                proxies.append(proxy)
+        return proxies
     return []
 
 
+def parse_proxy_file(proxy_file_env_var: str) -> list:
+    """Read proxies from a txt file path stored in an env var, one proxy per line."""
+    file_path = os.environ.get(proxy_file_env_var, "").strip()
+    if not file_path:
+        return []
+    try:
+        if file_path.startswith(("http://", "https://")):
+            with urllib.request.urlopen(file_path, timeout=10) as response:
+                text = response.read().decode("utf-8", errors="ignore")
+        else:
+            with open(file_path, "r", encoding="utf-8") as file:
+                text = file.read()
+
+        proxies = []
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("="):
+                line = line[1:].strip()
+            if not line or line.startswith("#"):
+                continue
+            proxies.append(line)
+        return proxies
+    except Exception as e:
+        logger.warning(f"Error reading proxy file {file_path}: {e}")
+        return []
+
+
 def get_extractor_proxies(extractor_name: str) -> list:
-    """Returns proxies from EXTRACTOR_PROXY env vars, e.g. VIXSRC_PROXY."""
+    """Returns proxies from EXTRACTOR_PROXY and EXTRACTOR_PROXY_FILE env vars."""
     if not extractor_name:
         return []
-    env_name = f"{extractor_name.upper().replace('-', '_')}_PROXY"
-    return parse_proxies(env_name)
+    prefix = extractor_name.upper().replace('-', '_')
+    proxies = []
+    for proxy in parse_proxies(f"{prefix}_PROXY") + parse_proxy_file(f"{prefix}_PROXY_FILE"):
+        if proxy and proxy not in proxies:
+            proxies.append(proxy)
+    return proxies
 
 
 def parse_transport_routes() -> list:

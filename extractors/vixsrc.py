@@ -14,6 +14,7 @@ from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from aiohttp_socks import ProxyError as AioProxyError
 from python_socks import ProxyError as PyProxyError
 from config import get_proxy_for_url, TRANSPORT_ROUTES, GLOBAL_PROXIES, get_connector_for_proxy, SELECTED_PROXY_CONTEXT
+from config import PROXY_TEST_TIMEOUT, PROXY_TEST_CONCURRENCY
 from config import FLARESOLVERR_URL, FLARESOLVERR_TIMEOUT, WARP_PROXY_URL
 
 logger = logging.getLogger(__name__)
@@ -200,41 +201,62 @@ class VixSrcExtractor:
         final_headers.pop("User-Agent", None)
         final_headers.pop("user-agent", None)
 
-        for imp in impersonations:
-            for proxy_value in proxies_to_try:
-                request_kwargs = {}
-                proxy = self._normalize_proxy_url(proxy_value) if proxy_value else None
-                if proxy:
-                    request_kwargs["proxies"] = {"http": proxy, "https": proxy}
-                    logger.info("curl_cffi using proxy %s for %s (imp=%s)", proxy, url, imp)
-                else:
-                    logger.info("curl_cffi using direct connection for %s (imp=%s)", url, imp)
+        timeout = int(os.environ.get("VIXSRC_PROXY_TIMEOUT", str(PROXY_TEST_TIMEOUT)))
+        concurrency = max(1, int(os.environ.get("VIXSRC_PROXY_CONCURRENCY", str(PROXY_TEST_CONCURRENCY))))
 
-                try:
-                    async with CurlAsyncSession(impersonate=imp) as session:
-                        resp = await session.get(
-                            url,
-                            headers=final_headers,
-                            timeout=30,
-                            allow_redirects=True,
-                            **request_kwargs,
-                        )
-                        content = resp.text
-
-                    last_status = resp.status_code
-                    logger.info(
-                        "curl_cffi status=%s len=%s for %s (imp=%s)",
-                        resp.status_code,
-                        len(content) if content else 0,
+        async def _try_one(proxy_value: str | None, imp: str):
+            request_kwargs = {}
+            proxy = self._normalize_proxy_url(proxy_value) if proxy_value else None
+            if proxy:
+                request_kwargs["proxies"] = {"http": proxy, "https": proxy}
+            try:
+                async with CurlAsyncSession(impersonate=imp) as session:
+                    resp = await session.get(
                         url,
-                        imp,
+                        headers=final_headers,
+                        timeout=timeout,
+                        allow_redirects=True,
+                        **request_kwargs,
                     )
-                    if 200 <= resp.status_code < 300:
+                    content = resp.text
+                if 200 <= resp.status_code < 300:
+                    return True, proxy, MockResponse(content, resp.status_code, url), None, resp.status_code
+                return False, proxy, None, None, resp.status_code
+            except Exception as exc:
+                return False, proxy, None, exc, None
+
+        for imp in impersonations:
+            logger.info(
+                "VixSrc curl_cffi testing %d proxies for %s (imp=%s, concurrency=%d, timeout=%ss)",
+                len(proxies_to_try), url, imp, concurrency, timeout,
+            )
+            semaphore = asyncio.Semaphore(concurrency)
+
+            async def _limited(proxy_value):
+                async with semaphore:
+                    return await _try_one(proxy_value, imp)
+
+            tasks = [asyncio.create_task(_limited(proxy_value)) for proxy_value in proxies_to_try]
+            try:
+                for task in asyncio.as_completed(tasks):
+                    ok, proxy, response, exc, status = await task
+                    if ok:
+                        for pending in tasks:
+                            if not pending.done():
+                                pending.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
                         self.last_used_proxy = proxy
-                        return MockResponse(content, resp.status_code, url)
-                except Exception as exc:
-                    last_error = exc
-                    logger.warning("curl_cffi request failed for %s via %s (imp=%s): %s", url, proxy or "direct", imp, exc)
+                        logger.info("curl_cffi success via %s for %s (imp=%s)", proxy or "direct", url, imp)
+                        return response
+                    if isinstance(status, int):
+                        last_status = status
+                    if exc:
+                        last_error = exc
+            finally:
+                for pending in tasks:
+                    if not pending.done():
+                        pending.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         if last_error:
             raise ExtractorError(f"curl_cffi request failed for {url}: {last_error}")
