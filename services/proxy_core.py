@@ -75,6 +75,7 @@ class HLSProxyCoreMixin:
             seen_sources.add(source_url)
             try:
                 proxy_token = SELECTED_PROXY_CONTEXT.set(forced_proxy)
+                strict_proxy_token = STRICT_PROXY_CONTEXT.set(bool(forced_proxy))
                 try:
                     extractor = await self.get_extractor(
                         source_url,
@@ -91,6 +92,7 @@ class HLSProxyCoreMixin:
                     )
                 finally:
                     SELECTED_PROXY_CONTEXT.reset(proxy_token)
+                    STRICT_PROXY_CONTEXT.reset(strict_proxy_token)
                 refreshed_headers = refreshed.get("request_headers", captured_headers)
                 refreshed_manifests = list((refreshed.get("captured_manifests") or {}).items())
                 if not refreshed_manifests and refreshed.get("captured_manifest"):
